@@ -48,6 +48,10 @@ extern "C"
         HAL_NVIC_EnableIRQ(DMA2_Stream2_IRQn);
         HAL_NVIC_SetPriority(DMA2_Stream3_IRQn, 0, 0);
         HAL_NVIC_EnableIRQ(DMA2_Stream3_IRQn);
+
+        // DMA2_Stream5_IRQn, interrupt configuration for TIM5
+        HAL_NVIC_SetPriority(DMA2_Stream5_IRQn, 0, 0);
+        HAL_NVIC_EnableIRQ(DMA2_Stream5_IRQn);
     }
 
     void dsy_dma_deinit(void)
@@ -80,6 +84,9 @@ extern "C"
         // DMA2_Stream2_IRQn and DMA2_Stream3_IRQn interrupt configuration for SPI
         HAL_NVIC_DisableIRQ(DMA2_Stream2_IRQn);
         HAL_NVIC_DisableIRQ(DMA2_Stream3_IRQn);
+
+        // DMA2_Stream4_IRQn, interrupt configuration for TIM5
+        HAL_NVIC_DisableIRQ(DMA2_Stream5_IRQn);
     }
 
     void dsy_dma_clear_cache_for_buffer(uint8_t* buffer, size_t size)

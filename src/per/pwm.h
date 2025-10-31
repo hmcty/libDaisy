@@ -73,7 +73,7 @@ class PWMHandle
         /** @brief period in ticks at TIM frequency before the counter resets.
          * Affects both the frequency and resolution of PWM.
          *  @note TIM3 and TIM4 are both 16-bit timers so the max period is 0xffff.
-         * TIM5 is a 32-bit timer so the max period is 0xffffffff (about 20 seconds
+
          * per reset).
          */
         uint32_t period;
@@ -93,6 +93,11 @@ class PWMHandle
         OK  = 0,
         ERR = 1,
     };
+
+    /** A callback to be executed right before a dma transfer is started. */
+    typedef void (*StartCallbackFunctionPtr)(void *context);
+    /** A callback to be executed after a dma transfer is completed. */
+    typedef void (*EndCallbackFunctionPtr)(void *context, Result result);
 
     class Channel
     {
@@ -167,8 +172,15 @@ class PWMHandle
             SetRaw(static_cast<uint32_t>(val * scale_));
         }
 
+        PWMHandle::Result
+        DmaTransmit(uint32_t                           *buff,
+                    size_t                              size,
+                    PWMHandle::StartCallbackFunctionPtr start_callback,
+                    PWMHandle::EndCallbackFunctionPtr   end_callback,
+                    void                               *callback_context);
+
       private:
-        PWMHandle &        owner_;
+        PWMHandle         &owner_;
         const uint32_t     channel_;
         Channel::Config    config_;
         float              scale_;
@@ -177,7 +189,7 @@ class PWMHandle
 
     PWMHandle();
 
-    PWMHandle(const PWMHandle &other) = default;
+    PWMHandle(const PWMHandle &other)            = default;
     PWMHandle &operator=(const PWMHandle &other) = default;
     ~PWMHandle() {}
 

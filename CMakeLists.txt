@@ -4,7 +4,7 @@ cmake_policy(SET CMP0135 NEW)
 
 # Set up our toolchain for cross-compilation if that's happening
 if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
-    include(${CMAKE_CURRENT_LIST_DIR}/cmake/toolchains/autodetect.cmake)
+  include(${CMAKE_CURRENT_LIST_DIR}/cmake/toolchains/autodetect.cmake)
 endif()
 
 # Declare our project
@@ -15,20 +15,20 @@ project(libDaisy VERSION 7.0.1)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake")
 
 if(NOT PROJECT_IS_TOP_LEVEL)
-    set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} PARENT_SCOPE)
+  set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} PARENT_SCOPE)
 else()
-    # Need to set sane default compile options for standalone library build
-    add_compile_options(
+  # Need to set sane default compile options for standalone library build
+  add_compile_options(
         $<$<CONFIG:Debug,RelWithDebInfo>:-ggdb3>
         $<$<CONFIG:Debug>:-Og>
         $<$<CONFIG:Release>:-O3>
         $<$<CONFIG:MinSizeRel>:-Os>
     )
-    add_compile_options($<$<CONFIG:Release,MinSizeRel,RelWithDebInfo>:-flto>)
-    add_link_options($<$<CONFIG:Release,MinSizeRel,RelWithDebInfo>:-flto>)
+  add_compile_options($<$<CONFIG:Release,MinSizeRel,RelWithDebInfo>:-flto>)
+  add_link_options($<$<CONFIG:Release,MinSizeRel,RelWithDebInfo>:-flto>)
 
-    # Define NDEBUG when not compiling with debug flags
-    add_compile_definitions($<$<CONFIG:Release,MinSizeRel>:NDEBUG>)
+  # Define NDEBUG when not compiling with debug flags
+  add_compile_definitions($<$<CONFIG:Release,MinSizeRel>:NDEBUG>)
 endif()
 
 cmake_path(SET MODULE_DIR "${CMAKE_CURRENT_LIST_DIR}/src")
@@ -72,6 +72,7 @@ add_library(daisy STATIC
     ${MODULE_DIR}/per/dac.cpp
     ${MODULE_DIR}/per/gpio.cpp
     ${MODULE_DIR}/per/i2c.cpp
+    ${MODULE_DIR}/per/pwm.cpp
     ${MODULE_DIR}/per/qspi.cpp
     ${MODULE_DIR}/per/rng.cpp
     ${MODULE_DIR}/per/sai.cpp
@@ -141,7 +142,7 @@ set_target_properties(daisy PROPERTIES
 
 # Don't add examples if we're being included in another project
 if(PROJECT_IS_TOP_LEVEL)
-    add_subdirectory(examples EXCLUDE_FROM_ALL)
-    get_all_targets(example_targets examples)
-    add_custom_target(examples DEPENDS ${example_targets})
+  add_subdirectory(examples EXCLUDE_FROM_ALL)
+  get_all_targets(example_targets examples)
+  add_custom_target(examples DEPENDS ${example_targets})
 endif()

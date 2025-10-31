@@ -127,8 +127,8 @@ transcode report.txt
 .visualgdb
 VisualGDBCache
 vs/*.log
+.zed
 
 tests/libDaisy_gtest
 tests/build/
 examples/**/build/
-

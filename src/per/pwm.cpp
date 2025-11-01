@@ -5,10 +5,10 @@
 #include "util/scopedirqblocker.h"
 #include <daisy_seed.h>
 
+#define NUM_TIMERS 3
+
 namespace daisy
 {
-
-extern DaisySeed hw;
 
 class PWMHandle::Impl
 {
@@ -20,27 +20,50 @@ class PWMHandle::Impl
 
     PWMHandle::Result InitDma(uint32_t channel);
     PWMHandle::Result SetDmaPeripheral(uint32_t channel);
-    bool              IsDmaBusy(uint32_t channel);
-    static void       DmaTransferFinished(TIM_HandleTypeDef *htim,
-                                          PWMHandle::Result  result);
+    PWMHandle::Result TransmitDma(uint32_t                       channel,
+                                  uint32_t                      *data,
+                                  uint16_t                       size,
+                                  PWMHandle::CallbackFunctionPtr callback,
+                                  void                          *context);
     PWMHandle::Result
-    DmaTransmit(uint32_t                            channel,
-                uint32_t                           *data,
-                size_t                              size,
-                PWMHandle::StartCallbackFunctionPtr start_callback,
-                PWMHandle::EndCallbackFunctionPtr   end_callback,
-                void                               *context);
+    StartDmaTransmission(uint32_t                       channel,
+                         uint32_t                      *data,
+                         uint16_t                       size,
+                         PWMHandle::CallbackFunctionPtr callback,
+                         void                          *context);
+
+    struct DmaJob
+    {
+        uint32_t                       channel          = TIM_CHANNEL_1;
+        uint32_t                      *data             = nullptr;
+        uint16_t                       size             = 0;
+        PWMHandle::CallbackFunctionPtr callback         = nullptr;
+        void                          *callback_context = nullptr;
+
+        bool IsValidJob() const { return data != nullptr && size > 0; }
+        void Invalidate() { data = nullptr; }
+    };
+
+    static void GlobalInit();
+    static bool IsDmaBusy();
+    static bool IsDmaTransferQueuedFor(size_t pwm_peripheral_idx);
+    static void QueueDmaTransfer(size_t pwm_peripheral_idx, const DmaJob &job);
+    static void DmaTransferFinished(TIM_HandleTypeDef *tim_hal_handle,
+                                    PWMHandle::Result  result);
+
+    static volatile int8_t                dma_active_peripheral_;
+    static uint32_t                       dma_peripheral_channel_;
+    static DmaJob                         queued_dma_transfers_[NUM_TIMERS];
+    static PWMHandle::CallbackFunctionPtr next_callback_;
+    static void                          *next_callback_context_;
 
     Config            config_;
     TIM_HandleTypeDef tim_hal_handle_{0};
     DMA_HandleTypeDef dma_hal_handle_{0};
 };
 
-#define NUM_TIMERS 3
-
 // Static storage for implementations
 static PWMHandle::Impl pwm_handles[NUM_TIMERS];
-static volatile int8_t dma_active_peripheral_ = -1;
 
 // ---------------------------------------------
 
@@ -190,27 +213,99 @@ PWMHandle::Result PWMHandle::Channel::DeInit()
     return PWMHandle::Result::OK;
 }
 
-PWMHandle::Result PWMHandle::Channel::DmaTransmit(
-    uint32_t                           *buff,
-    size_t                              size,
-    PWMHandle::StartCallbackFunctionPtr start_callback,
-    PWMHandle::EndCallbackFunctionPtr   end_callback,
-    void                               *callback_context)
+PWMHandle::Result
+PWMHandle::Channel::TransmitDma(uint32_t                      *buff,
+                                size_t                         size,
+                                PWMHandle::CallbackFunctionPtr callback,
+                                void                          *callback_context)
 {
-    if(handle_ == nullptr)
-        return PWMHandle::Result::ERR;
-
-    if(HAL_TIM_PWM_Stop(&owner_.pimpl_->tim_hal_handle_, channel_) != HAL_OK)
-    {
-        return PWMHandle::Result::ERR;
-    }
-
-    return owner_.pimpl_->DmaTransmit(
-        channel_, buff, size, start_callback, end_callback, callback_context);
+    return owner_.pimpl_->StartDmaTransmission(
+        channel_, buff, size, callback, callback_context);
 }
 
+// ----------------------------------------------------------------------------
 
-// -------------------------------------------------------------------------
+void PWMHandle::Impl::GlobalInit()
+{
+    dma_active_peripheral_ = -1;
+    for(size_t i = 0; i < NUM_TIMERS; i++)
+    {
+        queued_dma_transfers_[i] = PWMHandle::Impl::DmaJob();
+    }
+}
+
+bool PWMHandle::Impl::IsDmaBusy()
+{
+    return dma_active_peripheral_ >= 0;
+}
+
+bool PWMHandle::Impl::IsDmaTransferQueuedFor(size_t pwm_peripheral_idx)
+{
+    return queued_dma_transfers_[pwm_peripheral_idx].IsValidJob();
+}
+
+void PWMHandle::Impl::QueueDmaTransfer(size_t pwm_peripheral_idx,
+                                       const PWMHandle::Impl::DmaJob &job)
+{
+    // Wait for any previous job on this peripheral to finish
+    // and the queue position to become free
+    while(IsDmaTransferQueuedFor(pwm_peripheral_idx)) {};
+
+    // Queue the job
+    ScopedIrqBlocker block;
+    queued_dma_transfers_[pwm_peripheral_idx] = job;
+}
+
+void PWMHandle::Impl::DmaTransferFinished(TIM_HandleTypeDef *htim,
+                                          PWMHandle::Result  result)
+{
+    ScopedIrqBlocker block;
+
+    // On an error, reinit the peripheral to clear any flags
+    if(result != PWMHandle::Result::OK)
+        HAL_TIM_PWM_Init(htim);
+
+    dma_active_peripheral_ = -1;
+
+    // Stop timer signal generation.
+    if(HAL_TIM_PWM_Stop_DMA(htim, dma_peripheral_channel_) != HAL_OK)
+    {
+        result = PWMHandle::Result::ERR;
+    }
+
+    if(next_callback_ != nullptr)
+    {
+        // The callback may setup another transmission, hence we shouldn't reset this to
+        // nullptr after the callback - it might overwrite the new transmission.
+        auto callback  = next_callback_;
+        next_callback_ = nullptr;
+        // Make the callback
+        callback(next_callback_context_, result);
+    }
+
+    // The callback could have started a new transmission right away...
+    if(IsDmaBusy())
+        return;
+
+    // Dma is still idle. Check if another TIM peripheral waits for a job.
+    for(int per = 0; per < NUM_TIMERS; per++)
+    {
+        if(IsDmaTransferQueuedFor(per))
+        {
+            PWMHandle::Result result = pwm_handles[per].StartDmaTransmission(
+                queued_dma_transfers_[per].channel,
+                queued_dma_transfers_[per].data,
+                queued_dma_transfers_[per].size,
+                queued_dma_transfers_[per].callback,
+                queued_dma_transfers_[per].callback_context);
+            if(result == PWMHandle::Result::OK)
+            {
+                queued_dma_transfers_[per].Invalidate();
+                return;
+            }
+        }
+    }
+}
 
 PWMHandle::Result PWMHandle::Impl::Init(const PWMHandle::Config &config)
 {
@@ -325,11 +420,10 @@ PWMHandle::Result PWMHandle::Impl::InitDma(uint32_t channel)
     dma_hal_handle_.Init.FIFOThreshold       = DMA_FIFO_THRESHOLD_FULL;
     dma_hal_handle_.Init.MemBurst            = DMA_MBURST_SINGLE;
     dma_hal_handle_.Init.PeriphBurst         = DMA_PBURST_SINGLE;
-    dma_hal_handle_.Init.Request             = DMA_REQUEST_TIM5_CH4;
-    // if(SetDmaPeripheral(channel) != PWMHandle::Result::OK)
-    // {
-    //     return PWMHandle::Result::ERR;
-    // }
+    if(SetDmaPeripheral(channel) != PWMHandle::Result::OK)
+    {
+        return PWMHandle::Result::ERR;
+    }
 
     dma_hal_handle_.Init.Direction = DMA_MEMORY_TO_PERIPH;
     if(HAL_DMA_Init(&dma_hal_handle_) != HAL_OK)
@@ -337,7 +431,17 @@ PWMHandle::Result PWMHandle::Impl::InitDma(uint32_t channel)
         return PWMHandle::Result::ERR;
     }
 
-    __HAL_LINKDMA(&tim_hal_handle_, hdma[TIM_DMA_ID_CC4], dma_hal_handle_);
+    uint16_t dma_id;
+    switch(channel)
+    {
+        case TIM_CHANNEL_1: dma_id = TIM_DMA_ID_CC1; break;
+        case TIM_CHANNEL_2: dma_id = TIM_DMA_ID_CC2; break;
+        case TIM_CHANNEL_3: dma_id = TIM_DMA_ID_CC3; break;
+        case TIM_CHANNEL_4: dma_id = TIM_DMA_ID_CC4; break;
+        default: return PWMHandle::Result::ERR;
+    }
+
+    __HAL_LINKDMA(&tim_hal_handle_, hdma[dma_id], dma_hal_handle_);
 
     return PWMHandle::Result::OK;
 }
@@ -402,73 +506,76 @@ PWMHandle::Result PWMHandle::Impl::SetDmaPeripheral(uint32_t channel)
     return PWMHandle::Result::OK;
 }
 
-bool PWMHandle::Impl::IsDmaBusy(uint32_t channel)
+PWMHandle::Result
+PWMHandle::Impl::TransmitDma(uint32_t                       channel,
+                             uint32_t                      *data,
+                             uint16_t                       size,
+                             PWMHandle::CallbackFunctionPtr callback,
+                             void                          *context)
 {
-    return dma_active_peripheral_ >= 0;
+    if(IsDmaBusy())
+    {
+        DmaJob job;
+        job.channel          = channel;
+        job.data             = data;
+        job.size             = size;
+        job.callback         = callback;
+        job.callback_context = context;
+
+        // Queue the job (blocks until queue position is free)
+        QueueDmaTransfer(int(config_.periph), job);
+        return PWMHandle::Result::OK;
+    }
+
+    return StartDmaTransmission(channel, data, size, callback, context);
 }
 
 PWMHandle::Result
-PWMHandle::Impl::DmaTransmit(uint32_t                            channel,
-                             uint32_t                           *buff,
-                             size_t                              size,
-                             PWMHandle::StartCallbackFunctionPtr start_callback,
-                             PWMHandle::EndCallbackFunctionPtr   end_callback,
-                             void *callback_context)
+PWMHandle::Impl::StartDmaTransmission(uint32_t                       channel,
+                                      uint32_t                      *buff,
+                                      uint16_t                       size,
+                                      PWMHandle::CallbackFunctionPtr callback,
+                                      void *callback_context)
 {
-    hw.PrintLine("C.0");
-
-    // while(HAL_TIM_GetChannelState(&tim_hal_handle_, channel)
-    //       != HAL_TIM_CHANNEL_STATE_READY)
-    // {
-    // };
-
     while(TIM_CHANNEL_STATE_GET(&tim_hal_handle_, channel)
           != HAL_TIM_CHANNEL_STATE_READY)
     {
-        //hw.PrintLine("C.0.1 - Channel is not READY");
-        // return PWMHandle::Result::ERR;
+        // If constant duty cycle was set, disable before starting DMA
+        if(!IsDmaBusy()
+           && (HAL_TIM_PWM_Stop(&tim_hal_handle_, channel) != HAL_OK))
+        {
+            return PWMHandle::Result::ERR;
+        }
     }
-
-    hw.PrintLine("C.1");
 
     if(InitDma(channel) != PWMHandle::Result::OK)
     {
-        if(end_callback)
-            end_callback(callback_context, PWMHandle::Result::ERR);
         return PWMHandle::Result::ERR;
     }
 
-    hw.PrintLine("C.2");
-
-    // ScopedIrqBlocker block;
-    dma_active_peripheral_ = int(config_.periph);
-
-    if(start_callback)
-        start_callback(callback_context);
-
-    auto hal_status
-        = HAL_TIM_PWM_Start_DMA(&tim_hal_handle_, TIM_CHANNEL_4, buff, size);
-    if(hal_status != HAL_OK)
     {
-        hw.PrintLine("C.2.1 - %d", hal_status);
-        if(end_callback)
-            end_callback(callback_context, PWMHandle::Result::ERR);
-        return PWMHandle::Result::ERR;
+        // TODO: Why can't we share scope with start of DMA?
+        ScopedIrqBlocker block;
+        dma_active_peripheral_  = int(config_.periph);
+        dma_peripheral_channel_ = channel;
+        next_callback_          = callback;
+        next_callback_context_  = callback_context;
     }
 
-    hw.PrintLine("C.3");
+    HAL_StatusTypeDef status
+        = HAL_TIM_PWM_Start_DMA(&tim_hal_handle_, channel, buff, size);
+    if(status != HAL_OK)
+    {
+        dma_active_peripheral_ = -1;
+        next_callback_         = nullptr;
+        next_callback_context_ = nullptr;
+        return PWMHandle::Result::ERR;
+    }
 
     return PWMHandle::Result::OK;
 }
 
-void PWMHandle::Impl::DmaTransferFinished(TIM_HandleTypeDef *htim,
-                                          PWMHandle::Result  result)
-{
-    ScopedIrqBlocker block;
-    dma_active_peripheral_ = -1;
-}
-
-// ---------------------------------------------------------------------
+// PUBLIC METHODS --------------------------------------------------------------
 
 PWMHandle::PWMHandle()
 : pimpl_(nullptr),
@@ -517,29 +624,33 @@ void PWMHandle::SetPeriod(uint32_t period)
     pimpl_->SetPeriod(period);
 }
 
-void HalPWMDmaCallback(void)
+// -----------------------------------------------------------------------------
+
+volatile int8_t         PWMHandle::Impl::dma_active_peripheral_;
+uint32_t                PWMHandle::Impl::dma_peripheral_channel_;
+PWMHandle::Impl::DmaJob PWMHandle::Impl::queued_dma_transfers_[NUM_TIMERS];
+
+PWMHandle::CallbackFunctionPtr PWMHandle::Impl::next_callback_;
+void                          *PWMHandle::Impl::next_callback_context_;
+
+extern "C" void dsy_pwm_global_init()
 {
-    // hw.PrintLine("C.5");
-    // ScopedIrqBlocker block;
-    // if(dma_active_peripheral_ >= 0)
-    //     HAL_DMA_IRQHandler(
-    //         &pwm_handles[dma_active_peripheral_].dma_hal_handle_);
-    // HAL_D
+    PWMHandle::Impl::GlobalInit();
 }
 
 extern "C" void DMA2_Stream5_IRQHandler(void)
 {
-    // HalPWMDmaCallback();
-    HAL_DMA_IRQHandler(&pwm_handles[2].dma_hal_handle_);
+    ScopedIrqBlocker block;
+    if(PWMHandle::Impl::dma_active_peripheral_ >= 0)
+    {
+        HAL_DMA_IRQHandler(&pwm_handles[PWMHandle::Impl::dma_active_peripheral_]
+                                .dma_hal_handle_);
+    }
 }
 
 extern "C" void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim)
 {
-    hw.PrintLine("C.4 - %d\n",
-                 HAL_DMA_GetError(&pwm_handles[2].dma_hal_handle_));
-    // hw.PrintLine("C.4");
-    // PWMHandle::Impl::DmaTransferFinished(htim, PWMHandle::Result::OK);
-    HAL_TIM_PWM_Stop_DMA(htim, TIM_CHANNEL_4);
+    PWMHandle::Impl::DmaTransferFinished(htim, PWMHandle::Result::OK);
 }
 
 } // namespace daisy

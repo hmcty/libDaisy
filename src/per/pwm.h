@@ -94,10 +94,8 @@ class PWMHandle
         ERR = 1,
     };
 
-    /** A callback to be executed right before a dma transfer is started. */
-    typedef void (*StartCallbackFunctionPtr)(void *context);
-    /** A callback to be executed after a dma transfer is completed. */
-    typedef void (*EndCallbackFunctionPtr)(void *context, Result result);
+    /** A callback to be executed right after a dma transfer completes. */
+    typedef void (*CallbackFunctionPtr)(void *context, Result result);
 
     class Channel
     {
@@ -172,12 +170,17 @@ class PWMHandle
             SetRaw(static_cast<uint32_t>(val * scale_));
         }
 
-        PWMHandle::Result
-        DmaTransmit(uint32_t                           *buff,
-                    size_t                              size,
-                    PWMHandle::StartCallbackFunctionPtr start_callback,
-                    PWMHandle::EndCallbackFunctionPtr   end_callback,
-                    void                               *callback_context);
+        /** @brief Transmit a series of PWM comparison values on the channel.
+         * \param buff   Buffer of compare values to transmit. Must be less than
+         *               or equal to the timer's period.
+         * \param size   Number of elements in the buffer.
+         * \param callback Function to call when transmission is complete.
+         * \param callback_context Context pointer to pass to the callback.
+         */
+        PWMHandle::Result TransmitDma(uint32_t                      *buff,
+                                      size_t                         size,
+                                      PWMHandle::CallbackFunctionPtr callback,
+                                      void *callback_context);
 
       private:
         PWMHandle         &owner_;
@@ -233,6 +236,12 @@ class PWMHandle
     Channel ch2_;
     Channel ch3_;
     Channel ch4_;
+};
+
+extern "C"
+{
+    /** internal. Used for global init. */
+    void dsy_pwm_global_init();
 };
 
 } // namespace daisy
